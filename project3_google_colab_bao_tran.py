@@ -6,6 +6,7 @@ import subprocess
 import sys
 
 # --- AUTO-INSTALL ULTRALYTICS ---
+# Ensures YOLOv11 libraries are present in the Colab runtime
 try:
     import ultralytics
 except ImportError:
@@ -19,14 +20,11 @@ from google.colab import drive
 # 0. SETUP & PATH CONFIGURATION
 # ==========================================
 def setup_environment():
-    # Mount Google Drive
+    # Mount Google Drive to access your dataset
     drive.mount('/content/gdrive')
 
-    # Define the Base Directory
-    # Based on your prompt: '/content/gdrive/MyDrive/Colab Notebooks/project3_data'
     BASE_DIR = '/content/gdrive/MyDrive/Colab Notebooks/project3_data'
 
-    # Check if directory exists
     if not os.path.exists(BASE_DIR):
         print(f"WARNING: Directory {BASE_DIR} not found. Please check your Drive paths.")
     else:
@@ -35,13 +33,11 @@ def setup_environment():
     return BASE_DIR
 
 # ==========================================
-# 1. PART 1: OBJECT MASKING (OpenCV)
+# 1. PART 1: OBJECT MASKING
 # ==========================================
 def step1_object_masking(base_dir):
     print("\n--- Starting Step 1: Object Masking ---")
 
-    # Construct path to the image
-    # Assuming the motherboard_image.JPEG is inside the project3_data folder
     img_path = os.path.join(base_dir, 'motherboard_image.JPEG')
 
     if not os.path.exists(img_path):
@@ -50,30 +46,29 @@ def step1_object_masking(base_dir):
 
     # 1. Read the image
     img = cv2.imread(img_path)
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # Convert to RGB for matplotlib display
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    # 2. Pre-processing (Blur to reduce noise)
+    # 2. Pre-processing
+    # Convert to grayscale and apply Gaussian Blur to reduce noise
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
 
-    # 3. Thresholding
-    # PROBLEM: The previous threshold (60) was too low. The motherboard (dark grey) was being treated as background.
-    # We increase it to catch the motherboard pixels (which are darker than the table but lighter than deep black).
-    # We also use MORPH_CLOSE to fill in the bright components (gold heatsinks) so the board looks like one solid block.
-    _, thresh = cv2.threshold(blur, 110, 255, cv2.THRESH_BINARY_INV)
+    # 3. Edge Detection (Canny)
+    edges = cv2.Canny(blur, 50, 150)
 
-    # Morphological operations to fill holes (components) and remove noise
-    kernel = np.ones((15, 15), np.uint8) # Large kernel to bridge gaps between components
-    mask = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    # 4. Morphological Operations
+    # Dilate the edges to connect gaps and form a solid boundary
+    kernel = np.ones((5, 5), np.uint8)
+    dilated = cv2.dilate(edges, kernel, iterations=2)
 
-    # Optional: Open to remove small white noise
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    # Close operation to fill inside the board area if needed
+    closed_mask = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, kernel)
 
-    # 4. Find Contours
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 5. Find Contours
+    contours, _ = cv2.findContours(closed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # 5. Filter Contours (Keep the largest one -> The Motherboard)
     if contours:
+        # Filter: The motherboard is the largest object in the scene
         largest_contour = max(contours, key=cv2.contourArea)
 
         # Create the final clean mask
@@ -84,7 +79,7 @@ def step1_object_masking(base_dir):
         result = cv2.bitwise_and(img, img, mask=final_mask)
         result_rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
 
-        # 7. Visualization (Required for Report)
+        # 7. Visualization
         plt.figure(figsize=(15, 5))
 
         plt.subplot(1, 3, 1)
@@ -93,8 +88,8 @@ def step1_object_masking(base_dir):
         plt.axis('off')
 
         plt.subplot(1, 3, 2)
-        plt.title("Generated Mask")
-        plt.imshow(final_mask, cmap='gray')
+        plt.title("Canny Edges (Dilated)")
+        plt.imshow(closed_mask, cmap='gray')
         plt.axis('off')
 
         plt.subplot(1, 3, 3)
@@ -104,34 +99,29 @@ def step1_object_masking(base_dir):
 
         plt.show()
 
-        # Save the result if needed
+        # Save the result
         output_path = os.path.join(base_dir, 'masked_motherboard_result.jpg')
         cv2.imwrite(output_path, result)
         print(f"Masked image saved to: {output_path}")
 
     else:
-        print("No contours found. Check threshold values.")
+        print("No contours found. Check Canny parameters.")
 
 # ==========================================
-# 2. PART 2: YOLOv11 TRAINING
+# 2. PART 2: YOLOv11 TRAINING (OPTIMIZED)
 # ==========================================
 def step2_yolo_training(base_dir):
     print("\n--- Starting Step 2: YOLOv11 Training ---")
 
-    # Path to your data.yaml
     yaml_path = os.path.join(base_dir, 'data.yaml')
 
-    # Load the model (Using YOLOv11 Nano as recommended)
-    # Note: Ensure 'ultralytics' is installed via: !pip install ultralytics
+    # Using YOLOv11 Nano (yolo11n.pt) as recommended
     model = YOLO('yolo11n.pt')
 
-    # HYPERPARAMETERS (Based on PDF requirements)
-    # epochs: Must be below 200
-    # imgsz: Minimum 900
-    # batch: T4 GPU usually handles 16 well, lower to 8 if OutOfMemory errors occur
-    EPOCHS = 100
+    # HYPERPARAMETERS
+    EPOCHS = 150
     IMG_SIZE = 900
-    BATCH_SIZE = 8
+    BATCH_SIZE = 8  # Kept at 8 to be safe for T4 GPU memory
     PROJECT_PATH = os.path.join(base_dir, 'runs/detect')
     NAME = 'pcb_component_model'
 
@@ -145,9 +135,11 @@ def step2_yolo_training(base_dir):
         batch=BATCH_SIZE,
         project=PROJECT_PATH,
         name=NAME,
-        exist_ok=True, # Overwrite if exists
-        plots=True,     # Automatically generates confusion matrix & curves
-        workers = 2     # LIMIT RAM USAGE CAUSE IT CRASHES
+        exist_ok=True,
+        plots=True,       # Saves confusion matrix and curves for your report
+        workers=2,        # Low worker count to save RAM
+        patience=25,      # Early stopping
+        augment=True      # Data augmentation to improve robustness
     )
 
     print("Training Complete.")
@@ -159,36 +151,34 @@ def step2_yolo_training(base_dir):
 def step3_evaluation(model, base_dir, save_dir):
     print("\n--- Starting Step 3: Evaluation ---")
 
-    # Path to evaluation images
     eval_folder = os.path.join(base_dir, 'evaluation')
 
     if not os.path.exists(eval_folder):
         print(f"Evaluation folder not found at {eval_folder}")
         return
 
-    # Get list of images in evaluation folder
-    image_files = [f for f in os.listdir(eval_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-
-    print(f"Found {len(image_files)} images for evaluation.")
-
     # Run Inference
-    # We use the same imgsz as training (900)
+    # Using conf=0.20 (slightly lower) to ensure small components are detected
     results = model.predict(
         source=eval_folder,
         imgsz=900,
-        conf=0.25,      # Confidence threshold (adjust if missing components)
-        save=True,      # Save the images with bounding boxes
+        conf=0.20,
+        iou=0.45,
+        save=True,
         project=save_dir,
         name='evaluation_results'
     )
 
-    # Display Results (Optional in Notebook)
+    print(f"Evaluation results saved to: {save_dir}/evaluation_results")
+
+    # Optional: Display results inline
     for result in results:
-        print(f"Processed: {result.path}")
-        # You can plot here if you want to see immediate output
-        # im_array = result.plot()  # plot a BGR numpy array of predictions
-        # plt.imshow(cv2.cvtColor(im_array, cv2.COLOR_BGR2RGB))
-        # plt.show()
+        # Plot results (BGR to RGB for matplotlib)
+        im_array = result.plot()
+        plt.figure(figsize=(10, 10))
+        plt.imshow(cv2.cvtColor(im_array, cv2.COLOR_BGR2RGB))
+        plt.axis('off')
+        plt.show()
 
 # ==========================================
 # MAIN EXECUTION
@@ -197,11 +187,10 @@ if __name__ == "__main__":
     # 1. Setup
     base_directory = setup_environment()
 
-    # 2. Run Masking
+    # 2. Run Masking (Improved with Canny)
     step1_object_masking(base_directory)
 
-    # 3. Run Training
-    # NOTE: This takes a long time.
+    # 3. Run Training (Optimized for T4)
     trained_model, run_path = step2_yolo_training(base_directory)
 
     # 4. Run Evaluation
